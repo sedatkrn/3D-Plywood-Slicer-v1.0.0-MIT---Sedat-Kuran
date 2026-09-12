@@ -1,0 +1,931 @@
+# -*- coding: utf-8 -*-
+"""
+3D Plywood Slicer - v17 (Clean Tree Structure)
+- Shape2DView based DXF generation
+- 3 separate groups: Solids / DXF Views / Temp (hidden)
+- English UI
+"""
+
+import os
+import glob
+import time
+import math
+import FreeCAD as App
+import FreeCADGui as Gui
+import Part
+import Draft
+from datetime import datetime
+from PySide import QtGui, QtCore
+
+
+# ============================================================
+# AUTO FONT
+# ============================================================
+
+def find_system_font():
+    preferred = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/TTF/DejaVuSans.ttf",
+        "/usr/share/fonts/droid/DroidSans.ttf",
+        "C:/Windows/Fonts/arial.ttf",
+        "C:/Windows/Fonts/Arial.ttf",
+    ]
+    for f in preferred:
+        if os.path.exists(f):
+            return f
+    for d in ["/usr/share/fonts", "C:/Windows/Fonts", "/Library/Fonts"]:
+        if not os.path.exists(d):
+            continue
+        for ext in ("*.ttf", "*.TTF", "*.otf", "*.OTF"):
+            matches = sorted(glob.glob(
+                os.path.join(d, "**", ext), recursive=True))
+            if matches:
+                return matches[0]
+    return None
+
+
+DEFAULT_FONT = find_system_font()
+
+
+# ============================================================
+# WIRE BBOX HELPERS
+# ============================================================
+
+def get_wire_bbox(wire):
+    xs, ys, zs = [], [], []
+    try:
+        for v in wire.Vertexes:
+            p = v.Point
+            xs.append(p.x); ys.append(p.y); zs.append(p.z)
+    except Exception:
+        return None
+    if not xs:
+        return None
+    return {
+        "xmin": min(xs), "xmax": max(xs),
+        "ymin": min(ys), "ymax": max(ys),
+        "zmin": min(zs), "zmax": max(zs),
+    }
+
+
+def wire_center(wire):
+    bb = get_wire_bbox(wire)
+    if bb is None:
+        return App.Vector(0, 0, 0)
+    return App.Vector(
+        (bb["xmin"] + bb["xmax"]) / 2.0,
+        (bb["ymin"] + bb["ymax"]) / 2.0,
+        (bb["zmin"] + bb["zmax"]) / 2.0
+    )
+
+
+def wire_bbox_area(wire):
+    bb = get_wire_bbox(wire)
+    if bb is None:
+        return 0.0
+    dx = bb["xmax"] - bb["xmin"]
+    dy = bb["ymax"] - bb["ymin"]
+    dz = bb["zmax"] - bb["zmin"]
+    dims = sorted([dx, dy, dz], reverse=True)
+    return dims[0] * dims[1]
+
+
+def point_inside_wire(pt, wire, tol=1e-6):
+    try:
+        face = Part.Face(wire)
+        return face.isInside(pt, tol, True)
+    except Exception:
+        bb = get_wire_bbox(wire)
+        if bb is None:
+            return False
+        return (bb["xmin"] <= pt.x <= bb["xmax"] and
+                bb["ymin"] <= pt.y <= bb["ymax"])
+
+
+# ============================================================
+# WIRE GROUPING
+# ============================================================
+
+def group_wires_by_nesting(wires):
+    if not wires:
+        return []
+    info = []
+    for w in wires:
+        try:
+            info.append({
+                "wire": w, "center": wire_center(w),
+                "area": wire_bbox_area(w),
+                "parent": -1, "level": 0
+            })
+        except Exception:
+            continue
+    if not info:
+        return []
+    info.sort(key=lambda d: d["area"], reverse=True)
+
+    for i in range(len(info)):
+        wi = info[i]
+        best_parent = -1
+        best_area = float("inf")
+        for j in range(len(info)):
+            if i == j:
+                continue
+            wj = info[j]
+            if wj["area"] <= wi["area"]:
+                continue
+            if point_inside_wire(wi["center"], wj["wire"]):
+                if wj["area"] < best_area:
+                    best_area = wj["area"]
+                    best_parent = j
+        wi["parent"] = best_parent
+
+    for i in range(len(info)):
+        level = 0
+        p = info[i]["parent"]
+        safety = 0
+        while p != -1 and safety < len(info):
+            level += 1
+            p = info[p]["parent"]
+            safety += 1
+        info[i]["level"] = level
+
+    groups = []
+    for i, wi in enumerate(info):
+        if wi["level"] % 2 == 0:
+            groups.append({
+                "outer": wi["wire"], "outer_idx": i, "inners": []
+            })
+
+    for i, wi in enumerate(info):
+        if wi["level"] % 2 == 1:
+            root_idx = wi["parent"]
+            safety = 0
+            while (root_idx != -1 and
+                   info[root_idx]["level"] % 2 == 1 and
+                   safety < len(info)):
+                root_idx = info[root_idx]["parent"]
+                safety += 1
+            for g in groups:
+                if g["outer_idx"] == root_idx:
+                    g["inners"].append(wi["wire"])
+                    break
+    return groups
+
+
+# ============================================================
+# SHAPESTRING
+# ============================================================
+
+def create_label_shapestring(label_text, position, size=8.0, font_file=None):
+    if font_file is None:
+        font_file = DEFAULT_FONT
+    if not font_file or not os.path.exists(font_file):
+        return None
+    try:
+        ss = Draft.makeShapeString(
+            String=label_text, FontFile=font_file,
+            Size=size, Tracking=0)
+        if ss:
+            ss.Placement.Base = position
+            ss.Label = "Label_" + label_text
+            return ss
+    except Exception as ex:
+        App.Console.PrintWarning("ShapeString failed: %s\n" % ex)
+    return None
+
+
+# ============================================================
+# SHAPE BBOX 2D
+# ============================================================
+
+def get_shape_bbox_2d(shape):
+    try:
+        bb = shape.BoundBox
+        return {
+            "xmin": bb.XMin, "xmax": bb.XMax,
+            "ymin": bb.YMin, "ymax": bb.YMax,
+            "width": bb.XLength, "height": bb.YLength,
+        }
+    except Exception:
+        return None
+
+
+# ============================================================
+# HTML REPORT
+# ============================================================
+
+def make_html_report(filepath, obj_label, axis_idx, step_mm,
+                     extrusion_mm, slice_data, export_info):
+    axis_names = ["Z (Horizontal)", "Y", "X"]
+    axis_str = axis_names[axis_idx]
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    total_area = sum(s["area"] for s in slice_data)
+    total_perimeter = sum(s["perimeter"] for s in slice_data)
+    total_holes = sum(s["hole_count"] for s in slice_data)
+
+    rows = ""
+    for s in slice_data:
+        rows += (
+            "<tr><td>{no:02d}</td><td>{area:,.2f}</td>"
+            "<td>{perimeter:,.2f}</td><td>{hole_count}</td>"
+            "<td>{face_count}</td></tr>"
+        ).format(**s)
+
+    html = """<!DOCTYPE html>
+<html><head><meta charset="UTF-8">
+<title>Slicing Report - {obj_label}</title>
+<style>
+body {{ font-family: sans-serif; max-width: 900px; margin: 30px auto;
+       padding: 20px; background: #f9f9f9; }}
+h1 {{ color: #1a5276; border-bottom: 3px solid #1a5276; }}
+h2 {{ color: #2874a6; border-left: 4px solid #2874a6; padding-left: 10px; }}
+.info-grid {{ display: grid; grid-template-columns: 220px 1fr;
+              gap: 8px 20px; background: #fff; padding: 15px; }}
+table {{ width: 100%; border-collapse: collapse; background: #fff;
+         margin-top: 15px; }}
+th {{ background: #1a5276; color: white; padding: 10px; text-align: left; }}
+td {{ padding: 8px; border-bottom: 1px solid #eee; }}
+tr:nth-child(even) td {{ background: #f7f9fb; }}
+.summary {{ background: #d4efdf; border-left: 5px solid #27ae60;
+            padding: 15px; margin-top: 20px; }}
+.warning {{ background: #fdebd0; border-left: 5px solid #e67e22;
+            padding: 15px; margin-top: 20px; }}
+</style></head><body>
+<h1>🪚 Slicing Report</h1>
+<h2>Project Information</h2>
+<dl class="info-grid">
+<dt>Object Name</dt><dd>{obj_label}</dd>
+<dt>Report Date</dt><dd>{now_str}</dd>
+<dt>Slicing Axis</dt><dd>{axis_str}</dd>
+<dt>Thickness / Step</dt><dd>{step_mm:.2f} mm</dd>
+<dt>Extrude Thickness</dt><dd>{extrusion_mm:.2f} mm</dd>
+<dt>Slice Count</dt><dd>{slice_count}</dd>
+<dt>Successful</dt><dd>{basarili}</dd>
+<dt>Failed</dt><dd>{basarisiz}</dd>
+</dl>
+<h2>Slice Details</h2>
+<table><thead><tr><th>No</th><th>Area (mm²)</th>
+<th>Perimeter (mm)</th><th>Hole Count</th><th>Face Count</th></tr></thead>
+<tbody>{rows}</tbody></table>
+<h2>Summary</h2>
+<div class="summary">
+<p><strong>Total Area:</strong> {total_area:,.2f} mm² ({total_area_m2:.4f} m²)</p>
+<p><strong>Total Perimeter:</strong> {total_perimeter:,.2f} mm</p>
+<p><strong>Total Holes:</strong> {total_holes}</p>
+</div>
+<div class="warning">
+<strong>📄 To convert to PDF:</strong> Ctrl+P → "Save as PDF"
+</div>
+<p style="text-align:center;color:#999;margin-top:40px;font-size:12px;">
+FreeCAD 3D Plywood Slicer - v17<br>{now_str}</p>
+</body></html>
+""".format(
+        obj_label=obj_label, now_str=now_str, axis_str=axis_str,
+        step_mm=step_mm, extrusion_mm=extrusion_mm,
+        slice_count=len(slice_data),
+        basarili=export_info.get("basarili", 0),
+        basarisiz=export_info.get("basarisiz", 0),
+        rows=rows, total_area=total_area,
+        total_area_m2=total_area / 1_000_000.0,
+        total_perimeter=total_perimeter, total_holes=total_holes,
+    )
+
+    try:
+        with open(filepath, "w", encoding="utf-8") as f:
+            f.write(html)
+        return True
+    except Exception as ex:
+        App.Console.PrintError("Report failed: %s\n" % ex)
+        return False
+
+
+def show_report_messagebox(slice_data, obj_label, axis_idx,
+                           step_mm, extrusion_mm, export_info):
+    msg = QtGui.QMessageBox()
+    msg.setWindowTitle("Slicing Complete")
+    msg.setIcon(QtGui.QMessageBox.Information)
+    msg.setText("✅ %d slices created.\n%d failed."
+                % (export_info.get("basarili", 0),
+                   export_info.get("basarisiz", 0)))
+    msg.setInformativeText("Generate an HTML report?")
+    btn_yes = msg.addButton("Generate Report", QtGui.QMessageBox.AcceptRole)
+    msg.addButton("Close", QtGui.QMessageBox.RejectRole)
+    msg.exec_()
+
+    if msg.clickedButton() == btn_yes:
+        save_path, _ = QtGui.QFileDialog.getSaveFileName(
+            None, "Save report",
+            os.path.join(os.path.expanduser("~"), "slice_report.html"),
+            "HTML Files (*.html)")
+        if not save_path:
+            return
+        if not save_path.lower().endswith(".html"):
+            save_path += ".html"
+        if make_html_report(save_path, obj_label, axis_idx,
+                            step_mm, extrusion_mm,
+                            slice_data, export_info):
+            if QtGui.QMessageBox.question(
+                None, "Report Created", "Open in browser?",
+                QtGui.QMessageBox.Yes | QtGui.QMessageBox.No,
+                QtGui.QMessageBox.Yes) == QtGui.QMessageBox.Yes:
+                try:
+                    import webbrowser
+                    webbrowser.open("file://" + save_path)
+                except Exception:
+                    pass
+
+
+# ============================================================
+# GET SHAPE
+# ============================================================
+
+def get_selected_shape(obj):
+    shape = None
+    if hasattr(obj, "Shape"):
+        try:
+            if not obj.Shape.isNull() and len(obj.Shape.Edges) > 0:
+                shape = obj.Shape
+        except Exception:
+            pass
+    if (shape is None or shape.isNull()) and hasattr(obj, "Tip") and obj.Tip:
+        try:
+            if hasattr(obj.Tip, "Shape") and not obj.Tip.Shape.isNull():
+                shape = obj.Tip.Shape
+        except Exception:
+            pass
+    if (shape is None or shape.isNull()) and hasattr(obj, "Group"):
+        try:
+            for child in obj.Group:
+                if hasattr(child, "Shape") and not child.Shape.isNull():
+                    shape = child.Shape
+                    break
+        except Exception:
+            pass
+    return shape
+
+
+# ============================================================
+# DIALOG
+# ============================================================
+
+class SlicerDialog(QtGui.QDialog):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("3D Plywood Slicer - v17")
+        self.resize(520, 720)
+
+        layout = QtGui.QVBoxLayout(self)
+
+        layout.addWidget(QtGui.QLabel("<b>Slicing Axis:</b>"))
+        self.axis_combo = QtGui.QComboBox()
+        self.axis_combo.addItems(
+            ["Z Axis (Horizontal)", "Y Axis", "X Axis"])
+        layout.addWidget(self.axis_combo)
+
+        layout.addWidget(QtGui.QLabel("<b>Plywood Thickness / Step (mm):</b>"))
+        self.step_spin = QtGui.QDoubleSpinBox()
+        self.step_spin.setRange(0.1, 1000.0)
+        self.step_spin.setDecimals(3)
+        self.step_spin.setValue(18.0)
+        layout.addWidget(self.step_spin)
+
+        layout.addWidget(QtGui.QLabel("<b>Extrude Thickness (mm):</b>"))
+        self.extrude_spin = QtGui.QDoubleSpinBox()
+        self.extrude_spin.setRange(0.1, 1000.0)
+        self.extrude_spin.setDecimals(3)
+        self.extrude_spin.setValue(18.0)
+        layout.addWidget(self.extrude_spin)
+
+        self.hole_check = QtGui.QCheckBox("Preserve inner holes")
+        self.hole_check.setChecked(True)
+        layout.addWidget(self.hole_check)
+
+        line1 = QtGui.QFrame()
+        line1.setFrameShape(QtGui.QFrame.HLine)
+        layout.addWidget(line1)
+
+        layout.addWidget(QtGui.QLabel("<b>Outputs:</b>"))
+
+        self.chk_solids = QtGui.QCheckBox("Create 3D solid slices")
+        self.chk_solids.setChecked(True)
+        layout.addWidget(self.chk_solids)
+
+        self.chk_views = QtGui.QCheckBox(
+            "Create Shape2DView (for DXF export)")
+        self.chk_views.setChecked(True)
+        layout.addWidget(self.chk_views)
+
+        self.chk_labels = QtGui.QCheckBox(
+            "Add slice labels (D01, D02, ...)")
+        self.chk_labels.setChecked(True)
+        layout.addWidget(self.chk_labels)
+
+        self.chk_hide_temp = QtGui.QCheckBox(
+            "Hide temporary solids (recommended)")
+        self.chk_hide_temp.setChecked(True)
+        layout.addWidget(self.chk_hide_temp)
+
+        line2 = QtGui.QFrame()
+        line2.setFrameShape(QtGui.QFrame.HLine)
+        layout.addWidget(line2)
+
+        layout.addWidget(QtGui.QLabel("<b>Layout Settings:</b>"))
+
+        h1 = QtGui.QHBoxLayout()
+        h1.addWidget(QtGui.QLabel("Base gap (mm):"))
+        self.gap_spin = QtGui.QDoubleSpinBox()
+        self.gap_spin.setRange(0.0, 500.0)
+        self.gap_spin.setDecimals(1)
+        self.gap_spin.setValue(20.0)
+        h1.addWidget(self.gap_spin)
+        layout.addLayout(h1)
+
+        h2 = QtGui.QHBoxLayout()
+        h2.addWidget(QtGui.QLabel("Row gap (mm):"))
+        self.row_gap_spin = QtGui.QDoubleSpinBox()
+        self.row_gap_spin.setRange(0.0, 500.0)
+        self.row_gap_spin.setDecimals(1)
+        self.row_gap_spin.setValue(30.0)
+        h2.addWidget(self.row_gap_spin)
+        layout.addLayout(h2)
+
+        h3 = QtGui.QHBoxLayout()
+        h3.addWidget(QtGui.QLabel("Max row width (mm):"))
+        self.max_width_spin = QtGui.QDoubleSpinBox()
+        self.max_width_spin.setRange(100.0, 10000.0)
+        self.max_width_spin.setDecimals(0)
+        self.max_width_spin.setValue(2440.0)
+        h3.addWidget(self.max_width_spin)
+        layout.addLayout(h3)
+
+        h5 = QtGui.QHBoxLayout()
+        h5.addWidget(QtGui.QLabel("Proportional factor:"))
+        self.prop_spin = QtGui.QDoubleSpinBox()
+        self.prop_spin.setRange(0.0, 1.0)
+        self.prop_spin.setDecimals(3)
+        self.prop_spin.setSingleStep(0.05)
+        self.prop_spin.setValue(0.15)
+        h5.addWidget(self.prop_spin)
+        layout.addLayout(h5)
+
+        line3 = QtGui.QFrame()
+        line3.setFrameShape(QtGui.QFrame.HLine)
+        layout.addWidget(line3)
+
+        layout.addWidget(QtGui.QLabel("<b>Label Font:</b>"))
+        font_layout = QtGui.QHBoxLayout()
+        self.font_line = QtGui.QLineEdit()
+        self.font_line.setText(DEFAULT_FONT or "")
+        self.font_line.setReadOnly(True)
+        font_layout.addWidget(self.font_line)
+        btn_font = QtGui.QPushButton("...")
+        btn_font.setFixedWidth(35)
+        btn_font.clicked.connect(self.pick_font)
+        font_layout.addWidget(btn_font)
+        layout.addLayout(font_layout)
+
+        self.font_status = QtGui.QLabel()
+        self.update_font_status()
+        self.font_status.setStyleSheet(
+            "background:#f0f0f0;padding:6px;border:1px solid #ccc;"
+            "font-size:11px;")
+        layout.addWidget(self.font_status)
+
+        line4 = QtGui.QFrame()
+        line4.setFrameShape(QtGui.QFrame.HLine)
+        layout.addWidget(line4)
+
+        buttons = QtGui.QDialogButtonBox(
+            QtGui.QDialogButtonBox.Ok | QtGui.QDialogButtonBox.Cancel)
+        buttons.button(QtGui.QDialogButtonBox.Ok).setText("SLICE")
+        buttons.button(QtGui.QDialogButtonBox.Cancel).setText("Cancel")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def pick_font(self):
+        start_dir = os.path.dirname(self.font_line.text()) \
+            if self.font_line.text() else "/usr/share/fonts"
+        path, _ = QtGui.QFileDialog.getOpenFileName(
+            self, "Select font", start_dir,
+            "Font Files (*.ttf *.otf)")
+        if path:
+            self.font_line.setText(path)
+            self.update_font_status()
+
+    def update_font_status(self):
+        fp = self.font_line.text()
+        if not fp:
+            self.font_status.setText("⚠️ No font")
+        elif not os.path.exists(fp):
+            self.font_status.setText("❌ Not found: %s" % fp)
+        else:
+            self.font_status.setText("✅ Font: %s" % os.path.basename(fp))
+
+    def get_font_file(self):
+        return self.font_line.text().strip()
+
+
+# ============================================================
+# MAIN MACRO
+# ============================================================
+
+def run_slicer():
+
+    App.Console.PrintMessage("\nFont: %s\n" % (DEFAULT_FONT or "NONE"))
+
+    sel = Gui.Selection.getSelection()
+    if not sel:
+        App.Console.PrintError("Select a Body or solid object!\n")
+        return
+
+    selected_obj = sel[0]
+    shape = get_selected_shape(selected_obj)
+
+    if shape is None or shape.isNull() or len(shape.Edges) == 0:
+        App.Console.PrintError("No valid geometry!\n")
+        return
+
+    App.Console.PrintMessage(
+        "Selected: %s, Shape: %s, Edges: %d\n"
+        % (selected_obj.Label, shape.ShapeType, len(shape.Edges)))
+
+    bb = shape.BoundBox
+
+    dialog = SlicerDialog()
+    if dialog.exec_() != QtGui.QDialog.Accepted:
+        return
+
+    axis_idx = dialog.axis_combo.currentIndex()
+    step = dialog.step_spin.value()
+    extrusion = dialog.extrude_spin.value()
+    keep_holes = dialog.hole_check.isChecked()
+    do_solids = dialog.chk_solids.isChecked()
+    do_views = dialog.chk_views.isChecked()
+    do_labels = dialog.chk_labels.isChecked()
+    hide_temp = dialog.chk_hide_temp.isChecked()
+    gap = dialog.gap_spin.value()
+    row_gap = dialog.row_gap_spin.value()
+    max_width = dialog.max_width_spin.value()
+    prop_factor = dialog.prop_spin.value()
+    font_file = dialog.get_font_file()
+
+    if do_labels and (not font_file or not os.path.exists(font_file)):
+        App.Console.PrintWarning("No font — labels skipped.\n")
+        do_labels = False
+
+    if axis_idx == 0:
+        min_val, max_val = bb.ZMin, bb.ZMax
+        normal = App.Vector(0, 0, 1)
+    elif axis_idx == 1:
+        min_val, max_val = bb.YMin, bb.YMax
+        normal = App.Vector(0, 1, 0)
+    else:
+        min_val, max_val = bb.XMin, bb.XMax
+        normal = App.Vector(1, 0, 0)
+
+    if (max_val - min_val) <= 0:
+        App.Console.PrintError("Zero size along axis!\n")
+        return
+
+    positions = []
+    current_pos = min_val + step / 2.0
+    while current_pos < max_val:
+        positions.append(current_pos)
+        current_pos += step
+
+    if not positions:
+        App.Console.PrintError("No slice positions!\n")
+        return
+
+    doc = App.activeDocument()
+    if not doc:
+        doc = App.newDocument()
+
+    # --------------------------------------------------------
+    # GROUPS — 3 separate, same level
+    # --------------------------------------------------------
+    ts = int(time.time())
+    solids_group = None
+    views_group = None
+    temp_group = None
+
+    if do_solids:
+        solids_group = doc.addObject(
+            "App::DocumentObjectGroup",
+            "%s_Solids_%d" % (selected_obj.Name, ts))
+        solids_group.Label = "%s - Solid Slices" % selected_obj.Label
+
+    if do_views:
+        # Visible DXF Views group
+        views_group = doc.addObject(
+            "App::DocumentObjectGroup",
+            "%s_DXF_%d" % (selected_obj.Name, ts))
+        views_group.Label = "%s - DXF Views (XY, Side by Side)" \
+            % selected_obj.Label
+
+        # Hidden Temp group
+        temp_group = doc.addObject(
+            "App::DocumentObjectGroup",
+            "%s_Temp_%d" % (selected_obj.Name, ts))
+        temp_group.Label = "%s - Temp (hidden)" % selected_obj.Label
+
+        if hide_temp:
+            try:
+                if temp_group.ViewObject:
+                    temp_group.ViewObject.Visibility = False
+            except Exception:
+                pass
+
+    App.Console.PrintMessage("\n" + "=" * 40 + "\n")
+    App.Console.PrintMessage("3D SLICING STARTED (v17)\n")
+    App.Console.PrintMessage("=" * 40 + "\n")
+    App.Console.PrintMessage("Object      : %s\n" % selected_obj.Label)
+    App.Console.PrintMessage("Slice count : %d\n" % len(positions))
+    App.Console.PrintMessage("Step        : %.3f mm\n" % step)
+    App.Console.PrintMessage("Extrude     : %.3f mm\n" % extrusion)
+    App.Console.PrintMessage("Axis        : %s\n"
+                             % ["Z (Horizontal)", "Y", "X"][axis_idx])
+    App.Console.PrintMessage("Holes       : %s\n"
+                             % ("ON" if keep_holes else "OFF"))
+    App.Console.PrintMessage("Solids      : %s\n"
+                             % ("ON" if do_solids else "OFF"))
+    App.Console.PrintMessage("Views       : %s\n"
+                             % ("ON" if do_views else "OFF"))
+    App.Console.PrintMessage("Labels      : %s\n"
+                             % ("ON" if do_labels else "OFF"))
+    App.Console.PrintMessage("Hide temp   : %s\n"
+                             % ("ON" if hide_temp else "OFF"))
+
+    created_count = 0
+    failed_count = 0
+    total = len(positions)
+    slice_data = []
+    view_items = []
+
+    progress = QtGui.QProgressDialog(
+        "Creating slices...", "Cancel", 0, total)
+    progress.setWindowTitle("Slicing")
+    progress.setWindowModality(QtCore.Qt.WindowModal)
+    progress.setMinimumDuration(0)
+    progress.setValue(0)
+
+    doc.openTransaction("3D Slicing")
+
+    try:
+        for i, pos in enumerate(positions):
+            if progress.wasCanceled():
+                break
+
+            slice_no = i + 1
+            progress.setValue(i)
+            progress.setLabelText(
+                "Slice %d / %d..." % (slice_no, total))
+            QtGui.QApplication.processEvents()
+
+            try:
+                wires = shape.slice(normal, pos)
+                if not wires:
+                    failed_count += 1
+                    continue
+
+                if keep_holes:
+                    groups = group_wires_by_nesting(wires)
+                else:
+                    groups = [{"outer": w, "inners": []} for w in wires]
+
+                faces = []
+                hole_count_total = 0
+                for g in groups:
+                    try:
+                        outer_w = g["outer"]
+                        inners = g["inners"]
+                        hole_count_total += len(inners)
+                        if not inners:
+                            f = Part.Face(outer_w)
+                        else:
+                            f = Part.Face([outer_w] + inners)
+                        if not f.isNull():
+                            faces.append(f)
+                    except Exception:
+                        try:
+                            f = Part.Face(g["outer"])
+                            if not f.isNull():
+                                faces.append(f)
+                        except Exception:
+                            pass
+
+                if not faces:
+                    failed_count += 1
+                    continue
+
+                half = extrusion / 2.0
+                offset = normal * (-half)
+                ev = normal * extrusion
+
+                solids = []
+                for face in faces:
+                    try:
+                        fc = face.copy()
+                        fc.translate(offset)
+                        s = fc.extrude(ev)
+                        if s and not s.isNull():
+                            solids.append(s)
+                    except Exception:
+                        pass
+
+                if not solids:
+                    failed_count += 1
+                    continue
+
+                # ------------------------------------------------
+                # SOLID SLICES
+                # ------------------------------------------------
+                if do_solids:
+                    if len(solids) == 1:
+                        final_shape = solids[0]
+                    else:
+                        final_shape = Part.makeCompound(solids)
+
+                    feat = doc.addObject(
+                        "Part::Feature",
+                        "%s_Slice_%02d" % (selected_obj.Name, slice_no))
+                    feat.Label = "Slice %02d" % slice_no
+                    feat.Shape = final_shape
+                    if solids_group:
+                        solids_group.addObject(feat)
+
+                # ------------------------------------------------
+                # SHAPE2DVIEW
+                # ------------------------------------------------
+                if do_views:
+                    for si, solid in enumerate(solids):
+                        temp_name = "%s_Tmp_%02d_%d" % (
+                            selected_obj.Name, slice_no, si)
+                        temp_obj = doc.addObject("Part::Feature", temp_name)
+                        temp_obj.Shape = solid
+                        temp_obj.ViewObject.Visibility = False
+
+                        if temp_group:
+                            temp_group.addObject(temp_obj)
+
+                        doc.recompute()
+
+                        try:
+                            view2d = Draft.makeShape2DView(temp_obj, normal)
+                            doc.recompute()
+                        except Exception as ex:
+                            App.Console.PrintWarning(
+                                "Shape2DView failed slice %d: %s\n"
+                                % (slice_no, ex))
+                            view2d = None
+
+                        if view2d:
+                            view_items.append({
+                                "slice_no": slice_no,
+                                "view": view2d,
+                                "temp_solid": temp_obj,
+                            })
+                            if views_group:
+                                views_group.addObject(view2d)
+                        else:
+                            try:
+                                doc.removeObject(temp_obj.Name)
+                            except Exception:
+                                pass
+
+                # ------------------------------------------------
+                # METRICS
+                # ------------------------------------------------
+                area = sum(f.Area for f in faces)
+                perimeter = sum(
+                    e.Length for f in faces for e in f.Edges)
+                slice_data.append({
+                    "no": slice_no,
+                    "area": area,
+                    "perimeter": perimeter,
+                    "hole_count": hole_count_total,
+                    "face_count": len(faces),
+                })
+
+                created_count += 1
+                App.Console.PrintMessage(
+                    "Slice %02d / %02d : OK\n" % (slice_no, total))
+
+            except Exception as ex:
+                failed_count += 1
+                App.Console.PrintError(
+                    "Slice %02d ERROR: %s\n" % (slice_no, ex))
+
+        # =====================================================
+        # LAYOUT + LABELS
+        # =====================================================
+        if do_views and view_items:
+            App.Console.PrintMessage(
+                "\nLaying out %d views side by side...\n"
+                % len(view_items))
+            QtGui.QApplication.processEvents()
+
+            cursor_x = 0.0
+            cursor_y = 0.0
+            row_height = 0.0
+            placed = 0
+
+            for item in view_items:
+                try:
+                    view2d = item["view"]
+                    vs = view2d.Shape
+                    vbb = get_shape_bbox_2d(vs)
+                    if vbb is None:
+                        continue
+
+                    w = vbb["width"]
+                    h = vbb["height"]
+
+                    size_factor = math.sqrt(w * h)
+                    proportional_gap = size_factor * prop_factor
+                    effective_gap = gap + proportional_gap
+
+                    if cursor_x > 0 and (cursor_x + w) > (max_width + 1e-6):
+                        cursor_x = 0.0
+                        cursor_y += row_height + row_gap
+                        row_height = 0.0
+
+                    target_min_x = cursor_x
+                    target_min_y = cursor_y
+
+                    cp = view2d.Placement.Base
+                    cur_min_x = vbb["xmin"] + cp.x
+                    cur_min_y = vbb["ymin"] + cp.y
+
+                    dx = target_min_x - cur_min_x
+                    dy = target_min_y - cur_min_y
+
+                    view2d.Placement.Base = App.Vector(
+                        cp.x + dx, cp.y + dy, 0)
+                    doc.recompute()
+
+                    if do_labels:
+                        label_pos = App.Vector(
+                            target_min_x,
+                            target_min_y + h + 5.0,
+                            0)
+                        ss = create_label_shapestring(
+                            "D%02d" % item["slice_no"],
+                            label_pos, size=10.0,
+                            font_file=font_file)
+                        if ss and views_group:
+                            views_group.addObject(ss)
+
+                    placed += 1
+                    cursor_x += w + effective_gap
+                    row_height = max(row_height, h)
+
+                except Exception as ex:
+                    App.Console.PrintWarning(
+                        "Layout error (D%02d): %s\n"
+                        % (item["slice_no"], ex))
+
+            App.Console.PrintMessage(
+                "Placed %d views\n" % placed)
+
+        doc.commitTransaction()
+
+    except Exception as ex:
+        doc.abortTransaction()
+        App.Console.PrintError("General error: %s\n" % ex)
+        progress.close()
+        raise
+    finally:
+        progress.setValue(total)
+        progress.close()
+
+    doc.recompute()
+    try:
+        Gui.activeDocument().activeView().fitAll()
+    except Exception:
+        pass
+
+    App.Console.PrintMessage("\n" + "=" * 40 + "\n")
+    App.Console.PrintMessage("SLICING COMPLETE\n")
+    App.Console.PrintMessage("=" * 40 + "\n")
+    App.Console.PrintMessage("Created : %d\n" % created_count)
+    App.Console.PrintMessage("Failed  : %d\n" % failed_count)
+    App.Console.PrintMessage("Total   : %d\n" % total)
+    App.Console.PrintMessage("Views   : %d\n" % len(view_items))
+    App.Console.PrintMessage("=" * 40 + "\n")
+
+    if slice_data:
+        show_report_messagebox(
+            slice_data, selected_obj.Label, axis_idx,
+            step, extrusion,
+            {"basarili": created_count, "basarisiz": failed_count})
+
+
+# ============================================================
+# RUN
+# ============================================================
+
+run_slicer()
